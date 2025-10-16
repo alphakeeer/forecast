@@ -1,94 +1,92 @@
-# test for NumPy NPY-file operations(read,write,save......) and contour
-
-# 读取NPY文件
-
 import glob
 import numpy as np
 import os
 import pandas as pd
 from tqdm import tqdm
 import xarray as xr
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # idx: "00  01  02  04  05  07  08  09  11  12  14  15  20  23  24  25  29  30  98  99"
-def load_wind_or_rader_single(patten,scale=10.0):
-    files = glob.glob(patten)
-    times_line = [os.path.basename(f).split('-')[0][-4:] + os.path.basename(f).split('-')[1][:4] for f in files]
-    data = [np.load(f) / scale for f in tqdm(files,desc="processing files", leave=False)]
-    data = np.array(data)
-    
-    # === 处理缺失值 ===
-    if "RADAR" in patten:
-        data[data == -32768] = np.nan  # 雷达数据中，-32768视为缺失
-    elif "WA" in patten:
-        data[data == -9] = np.nan   # 风场数据中，-9视为缺失
+def load_wind_or_rader_single(pattern, scale=10.0, num_workers=8):
+    files = glob.glob(pattern)
+    if not files:
+        return xr.DataArray(), pd.to_datetime([])
 
-    # === 将时间字符串转为时间戳 ===
-    times_line = pd.to_datetime(['2000' + t for t in times_line], format='%Y%m%d%H%M')
-    # === 四舍五入到最近6分钟 ===
-    times_line = times_line.round('6min')
-    
-    # 去重: 保留最后一个出现的时间点
-    rev_idx = np.arange(len(times_line))[::-1]
+    # 提前生成 times_line（不重复做字符串操作）
+    basenames = [os.path.basename(f) for f in files]
+    times_line = ['2000' + b.split('-')[0][-4:] +
+                  b.split('-')[1][:4] for b in basenames]
+    times_line = pd.to_datetime(times_line, format='%Y%m%d%H%M').round('6min')
+
+    # 并行加载数据
+    def _load_file(f):
+        return np.load(f) / scale
+
+    with ThreadPoolExecutor(max_workers=num_workers) as ex:
+        data = list(ex.map(_load_file, files))
+
+    data = np.array(data, dtype=np.float32)
+
+    # 缺失值处理
+    if "RADAR" in pattern:
+        data[data == -32768] = np.nan
+    elif "WA" in pattern:
+        data[data == -9] = np.nan
+
+    # 去重: 保留最后一个时间点
     _, unique_idx = np.unique(times_line[::-1], return_index=True)
-    # 还原到原始顺序
-    keep_idx = rev_idx[unique_idx][::-1]
+    keep_idx = np.sort(len(times_line) - 1 - unique_idx)
     times_line = times_line[keep_idx]
     data = data[keep_idx]
-    
-    
-    # === 构建xarray对象 ===
-    data = xr.DataArray(
-        data,
-        coords={'time': times_line},
-        dims=['time', 'x', 'y']
-    )
 
-    return data, times_line
+    # 构建 xarray
+    da = xr.DataArray(data, coords={'time': times_line}, dims=[
+                      'time', 'x', 'y'])
+    return da, times_line
 
 # radar_type: "CR  R05  RG1  RG2  V05  V15  VIL"
-def load_wind_radar_data(idx: str, radar_type: str):
-    """
-    加载指定索引的风场与雷达数据
-    返回:
-        dict: {time_station_id: (x坐标, y坐标, 风场数据, 雷达数据)}
-    """
+
+
+def load_wind_radar_data(idx: str, radar_type: str, num_workers=4):
     base_dir = "/home/dataset-assist-1/SevereWeather_AI_2025"
     src = os.path.join(base_dir, "TSW", "TrainSet", idx)
+    dirs_list = os.listdir(src)
     result = {}
 
-    for dirs in tqdm(os.listdir(src), desc="processing dirs"):
-        # 读取 WA 文件
-        pattern = os.path.join(src, dirs, "LABEL", "WA", "*.npy")
-        wind_data, wa_times_line = load_wind_or_rader_single(pattern, scale=10.0)
+    def process_dir(dirs):
+        wa_pattern = os.path.join(src, dirs, "LABEL", "WA", "*.npy")
+        radar_pattern = os.path.join(src, dirs, "RADAR", radar_type, "*.npy")
+        wind_data, wa_times = load_wind_or_rader_single(wa_pattern, scale=10.0)
+        radar_data, radar_times = load_wind_or_rader_single(
+            radar_pattern, scale=1.0)
 
-        # 读取雷达文件
-        pattern = os.path.join(src, dirs, "RADAR", radar_type, "*.npy")
-        radar_data, radar_times_line = load_wind_or_rader_single(pattern, scale=1.0)
+        if len(wa_times) == 0 or len(radar_times) == 0:
+            return None
 
-        # === 创建统一时间网格 ===
-        start = min(wa_times_line.min(), radar_times_line.min()).floor('6min')
-        end = max(wa_times_line.max(), radar_times_line.max()).ceil('6min')
+        start = min(wa_times.min(), radar_times.min()).floor('6min')
+        end = max(wa_times.max(), radar_times.max()).ceil('6min')
         time_grid = pd.date_range(start, end, freq='6min')
 
-        # === 同步对齐两者时间 ===
-        da_wind_aligned = wind_data.reindex(time=time_grid)
-        da_radar_aligned = radar_data.reindex(time=time_grid)
+        da_wind = wind_data.reindex(time=time_grid)
+        da_radar = radar_data.reindex(time=time_grid)
 
-        # === 缺失帧填充 ===
-        # da_wind_aligned = da_wind_aligned.fillna(0)
-        # da_radar_aligned = da_radar_aligned.fillna(0)
-
-        # 解析目录信息
         stanum = dirs[-5:]
         time_info = dirs[-15:-5]
+        key = f"{time_info}{stanum}"
+        return key, xr.Dataset({'wind': da_wind, 'radar': da_radar})
 
-        result[f"{time_info}{stanum}"] = xr.Dataset({
-            'wind': da_wind_aligned,
-            'radar': da_radar_aligned
-        })
+    with ThreadPoolExecutor(max_workers=num_workers) as ex:
+        futures = [ex.submit(process_dir, d) for d in dirs_list]
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="processing dirs"):
+            res = fut.result()
+            if res:
+                result[res[0]] = res[1]
 
     return result
+
+
+load_wind_radar_data("00", radar_type="CR", num_workers=8)
 
 
 def load_wind_data(idx: str):
