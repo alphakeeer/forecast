@@ -2,13 +2,20 @@ import glob
 import numpy as np
 import os
 import pandas as pd
-from tqdm import tqdm
 import xarray as xr
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    from tqdm import tqdm  # fallback to console tqdm
+
+# radar_type: "CR  R05  RG1  RG2  V05  V15  VIL"
 
 # idx: "00  01  02  04  05  07  08  09  11  12  14  15  20  23  24  25  29  30  98  99"
-def load_wind_or_rader_single(pattern, scale=10.0, num_workers=8):
+
+
+def load_wind_or_rader_single(pattern, lat, lon, num_workers=8):
     files = glob.glob(pattern)
     if not files:
         return xr.DataArray(), pd.to_datetime([])
@@ -21,7 +28,7 @@ def load_wind_or_rader_single(pattern, scale=10.0, num_workers=8):
 
     # 并行加载数据
     def _load_file(f):
-        return np.load(f) / scale
+        return np.load(f).astype(np.float32)
 
     with ThreadPoolExecutor(max_workers=num_workers) as ex:
         data = list(ex.map(_load_file, files))
@@ -31,7 +38,10 @@ def load_wind_or_rader_single(pattern, scale=10.0, num_workers=8):
     # 缺失值处理
     if "RADAR" in pattern:
         data[data == -32768] = np.nan
-    elif "WA" in pattern:
+        data[data == -32767] = np.nan
+        data[data == -1280] = np.nan
+        data = data / 10
+    elif "LABEL" in pattern:
         data[data == -9] = np.nan
 
     # 去重: 保留最后一个时间点
@@ -41,11 +51,28 @@ def load_wind_or_rader_single(pattern, scale=10.0, num_workers=8):
     data = data[keep_idx]
 
     # 构建 xarray
-    da = xr.DataArray(data, coords={'time': times_line}, dims=[
-                      'time', 'x', 'y'])
+    da = xr.DataArray(
+        data,
+        coords={'time': times_line, 'lat': lat, 'lon': lon},
+        dims=['time', 'lat', 'lon'])
     return da, times_line
 
-# radar_type: "CR  R05  RG1  RG2  V05  V15  VIL"
+
+def load_lat_lon(stanum: str):
+    base_dir = "/home/dataset-assist-1/SevereWeather_AI_2025"
+    formatfile = os.path.join(
+        base_dir, "FORMAT", "Label_Format_DOC", f"Label_Format_{stanum}.txt")
+    labelfmt = pd.read_csv(formatfile)
+
+    def get_value(row):
+        return round(float(labelfmt.iloc[row, 0].split('=')[1]), 4)
+
+    lons, lats = get_value(0), get_value(1)
+    lone, late = get_value(2), get_value(3)
+
+    lon = np.linspace(lons, lone, 301)
+    lat = np.linspace(late, lats, 301)[::-1]
+    return lat, lon
 
 
 def load_wind_radar_data(idx: str, radar_type: str, num_workers=4):
@@ -55,11 +82,17 @@ def load_wind_radar_data(idx: str, radar_type: str, num_workers=4):
     result = {}
 
     def process_dir(dirs):
+        stanum = dirs[-5:]
+        time_info = dirs[-15:-5]
+        key = f"{time_info}{stanum}"
+
         wa_pattern = os.path.join(src, dirs, "LABEL", "WA", "*.npy")
         radar_pattern = os.path.join(src, dirs, "RADAR", radar_type, "*.npy")
-        wind_data, wa_times = load_wind_or_rader_single(wa_pattern, scale=10.0)
+        lat, lon = load_lat_lon(dirs[-5:])
+        wind_data, wa_times = load_wind_or_rader_single(
+            wa_pattern, lat=lat, lon=lon)
         radar_data, radar_times = load_wind_or_rader_single(
-            radar_pattern, scale=1.0)
+            radar_pattern, lat=lat, lon=lon)
 
         if len(wa_times) == 0 or len(radar_times) == 0:
             return None
@@ -71,9 +104,6 @@ def load_wind_radar_data(idx: str, radar_type: str, num_workers=4):
         da_wind = wind_data.reindex(time=time_grid)
         da_radar = radar_data.reindex(time=time_grid)
 
-        stanum = dirs[-5:]
-        time_info = dirs[-15:-5]
-        key = f"{time_info}{stanum}"
         return key, xr.Dataset({'wind': da_wind, 'radar': da_radar})
 
     with ThreadPoolExecutor(max_workers=num_workers) as ex:
@@ -86,7 +116,10 @@ def load_wind_radar_data(idx: str, radar_type: str, num_workers=4):
     return result
 
 
-load_wind_radar_data("00", radar_type="CR", num_workers=8)
+result = load_wind_radar_data("00", radar_type="CR", num_workers=8)
+
+ds = result[next(iter(result))]  # 随便取一个样本
+print(ds)
 
 
 def load_wind_data(idx: str):
