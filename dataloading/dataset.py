@@ -1,9 +1,11 @@
 import json, os, numpy as np, pandas as pd, xarray as xr, torch
 from functools import lru_cache
+import time
 
 from torch.utils.data import Dataset
 from dataloading.datayield  import yield_aligned_from_json
 from dataloading.datayield import load_npy_files
+
 
 
 class SimpleWindRadarDataset(Dataset):
@@ -51,16 +53,31 @@ class SimpleWindRadarDataset(Dataset):
 class FullSequenceWindRadarDataset(Dataset):
     """
     🚀 纯加载 Dataset
+    - 支持多个 radar_type
     - 训练时配合 collate_fn 或模型内部进行窗口化
     - 支持多进程并行 + 缓存
     """
-    def __init__(self, json_path, radar_type="V05", cache_size=32):
+    def __init__(self, json_path, radar_type=["V05","CR"], cache_size=32):
         with open(json_path, "r") as f:
             idx = json.load(f)
         self.wind_dict = idx["wind"]
-        self.radar_dict = idx[radar_type]
-        self.keys = [k for k in self.wind_dict.keys() if k in self.radar_dict]
 
+        # 检查雷达类型是否都存在
+        self.radar_types = radar_type
+        for rt in self.radar_types:
+            if rt not in idx:
+                raise ValueError(f"Radar type '{rt}' not found in dataset JSON keys: {list(idx.keys())}")
+
+        # 每种雷达类型的索引
+        self.radar_dicts = {rt: idx[rt] for rt in self.radar_types}
+
+        # 仅保留同时存在于 wind 和所有 radar 类型的 key
+        self.keys = [
+            k for k in self.wind_dict.keys()
+            if all(k in self.radar_dicts[rt] for rt in self.radar_types)
+        ]
+
+        # 缓存机制
         self._load_key_data = lru_cache(maxsize=cache_size)(self._load_key_data_uncached)
 
     def __len__(self):
@@ -68,24 +85,67 @@ class FullSequenceWindRadarDataset(Dataset):
 
     def _load_key_data_uncached(self, key):
         wind_files = self.wind_dict[key]
-        radar_files = self.radar_dict[key]
         wind_data, wind_times = load_npy_files(wind_files)
-        radar_data, radar_times = load_npy_files(radar_files)
 
-        start = min(wind_times.min(), radar_times.min()).floor("6min")
-        end   = max(wind_times.max(), radar_times.max()).ceil("6min")
+        radar_datas = []
+        radar_times_all = []
+
+        # 加载每种雷达数据
+        for rt in self.radar_types:
+            radar_files = self.radar_dicts[rt][key]
+            radar_data, radar_times = load_npy_files(radar_files)
+            radar_datas.append((radar_data, radar_times))
+            radar_times_all.append(radar_times)
+
+        # 时间对齐范围
+        start = min(wind_times.min(), *(rt.min() for _, rt in radar_datas)).floor("6min")
+        end   = max(wind_times.max(), *(rt.max() for _, rt in radar_datas)).ceil("6min")
         grid  = pd.date_range(start, end, freq="6min")
 
-        da_wind  = xr.DataArray(wind_data, coords={"time": wind_times}, dims=["time", "y", "x"])
-        da_radar = xr.DataArray(radar_data, coords={"time": radar_times}, dims=["time", "y", "x"])
+        # 对齐风场
+        da_wind = xr.DataArray(wind_data, coords={"time": wind_times}, dims=["time", "y", "x"])
+        wind_aligned = da_wind.reindex(time=grid).values.astype(np.float32)
 
-        wind_aligned  = da_wind.reindex(time=grid).values.astype(np.float32)
-        radar_aligned = da_radar.reindex(time=grid).values.astype(np.float32)
+        # 对齐多个雷达
+        aligned_radars = []
+        for radar_data, radar_times in radar_datas:
+            da_radar = xr.DataArray(radar_data, coords={"time": radar_times}, dims=["time", "y", "x"])
+            aligned = da_radar.reindex(time=grid).values.astype(np.float32)
+            aligned_radars.append(aligned)
 
-        return torch.from_numpy(radar_aligned), torch.from_numpy(wind_aligned)
+        # 堆叠多个雷达类型 => shape: [num_types, time, y, x]
+        radar_stacked = np.stack(aligned_radars, axis=0)
+
+        return torch.from_numpy(radar_stacked), torch.from_numpy(wind_aligned)
 
     def __getitem__(self, idx):
         key = self.keys[idx]
         radar, wind = self._load_key_data(key)
         return key, radar, wind
+    
+def test_dataset_shapes_and_times():
+    json_path = "/home/dataset-assist-0/data/data_index_flat_train.json"
+    radar_types = ['CR', 'R05', 'RG1', 'RG2', 'V05', 'V15', 'VIL']# 你要测试的雷达类型
 
+    dataset = FullSequenceWindRadarDataset(json_path, radar_type=radar_types, cache_size=4)
+
+    print(f"✅ Total samples: {len(dataset)}")
+    if len(dataset) == 0:
+        print("❌ Dataset is empty, please check your json or keys.")
+        return
+
+    # 随机抽几个样本进行测试
+    for i in range(min(3, len(dataset))):
+        start_time = time.time()
+        key, radar, wind = dataset[i]
+        print(f"\n🌀 Sample {i} — key: {key}")
+
+        # 打印基本形状信息
+        print(f"Radar shape: {radar.shape}")  # [num_types, time, y, x]
+        print(f"Wind  shape: {wind.shape}")   # [time, y, x]
+
+        e_time = time.time() - start_time
+        print(f"⏱️  Load time: {e_time:.3f} seconds")
+
+if __name__ == "__main__":
+    test_dataset_shapes_and_times()
